@@ -4,7 +4,10 @@ import numpy as np
 from collections import OrderedDict
 from pytracking.evaluation.environment import env_settings
 import time
+import json
+from tqdm import tqdm
 import cv2 as cv
+import pycocotools.mask
 from pytracking.utils.visdom import Visdom
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -379,6 +382,125 @@ class Tracker:
             tracked_bb = np.array(output_boxes).astype(int)
             bbox_file = '{}.txt'.format(base_results_path)
             np.savetxt(bbox_file, tracked_bb, delimiter='\t', fmt='%d')
+    
+    def run_frames(self, frame_paths, optional_mask=None, optional_box=None, debug=None, visdom_info=None,
+                   save_results=False, output_folder=""):
+        """
+        Run the tracker with a list of frames
+        """
+        params = self.get_parameters()
+        debug_ = debug
+        if debug is None:
+            debug_ = getattr(params, 'debug', 0)
+        params.debug = debug_
+        params.tracker_name = self.name
+        params.param_name = self.parameter_name
+
+        self._init_visdom(visdom_info, debug_)
+
+        multiobj_mode = getattr(params, 'multiobj_mode', getattr(self.tracker_class, 'multiobj_mode', 'default'))
+        if multiobj_mode == 'default':
+            tracker = self.create_tracker(params)
+            if hasattr(tracker, 'initialize_features'):
+                tracker.initialize_features()
+        elif multiobj_mode == 'parallel':
+            tracker = MultiObjectWrapper(self.tracker_class, params, self.visdom, fast_load=True)
+        else:
+            raise ValueError('Unknown multi object mode {}'.format(multiobj_mode))
+
+        if save_results and output_folder:
+            print(f"{output_folder = }")
+            os.makedirs(output_folder, exist_ok=True)
+
+        print(f"{frame_paths[0] = }")
+        frame = cv.imread(frame_paths[0])
+        assert frame is not None, f"File doesn't exist: {frame_paths[0] = }"
+        im_h, im_w, _ = frame.shape
+
+        display_name = 'Display: ' + tracker.params.tracker_name
+        cv.namedWindow(display_name, cv.WINDOW_NORMAL | cv.WINDOW_KEEPRATIO)
+        cv.resizeWindow(display_name, im_w, im_h)
+        cv.imshow(display_name, frame)
+
+        def _build_init_info(box):
+            return {'init_bbox': OrderedDict({1: box}), 'init_object_ids': [1, ], 'object_ids': [1, ],
+                    'sequence_object_ids': [1, ]}
+
+        prev_output = OrderedDict()
+        if optional_box is None and optional_mask is None:
+            while True:
+                frame_vis = frame.copy()
+                cv.putText(frame_vis, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL,
+                           1.5, (0, 0, 0), 1)
+                x, y, w, h = cv.selectROI(display_name, frame_vis, fromCenter=False)
+                init_state = [x, y, w, h]
+                init_out = tracker.initialize(frame, _build_init_info(init_state))
+                prev_output['segmentation_raw'] = init_out['segmentation_raw']
+                break
+        elif optional_mask is not None:
+            mask = optional_mask.astype(bool)
+            ys, xs = np.nonzero(mask)
+            x1, y1 = xs.min(), ys.min()
+            x2, y2 = xs.max(), ys.max()
+            init_state = [x1, y1, x2 - x1, y2 - y1]  # XYWH_ABS
+            tracker.initialize(frame, _build_init_info(init_state))
+            prev_output['segmentation_raw'] = OrderedDict({1: mask.astype(np.float32)})
+            print("Initialize from optional mask")
+        else:  # optional_box is not None
+            assert isinstance(optional_box, (list, tuple))
+            assert len(optional_box) == 4, "valid box's format is [x,y,w,h]"
+            init_out = tracker.initialize(frame, _build_init_info(optional_box))
+            prev_output['segmentation_raw'] = init_out['segmentation_raw']
+            print("Initialize from optional bbox")
+
+        for frame_idx, frame_path in enumerate(tqdm(frame_paths)):
+            frame = cv.imread(frame_path)
+            frame_vis = frame.copy()
+
+            # Draw box
+            if tracker.params.tracker_name in ['rts', 'lwl']:
+                info = OrderedDict()
+                info['previous_output'] = prev_output
+                out = tracker.track(frame, info)
+                prev_output = OrderedDict(out)
+            else:
+                out = tracker.track(frame)
+            state = [int(round(s)) for s in out['target_bbox'][1]]
+
+            if 'segmentation' in out:
+                frame_vis = overlay_mask(frame_vis, out['segmentation'])
+
+            cv.rectangle(frame_vis, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]), (0, 255, 0), 5)
+
+            font_color = (0, 0, 0)
+            cv.putText(frame_vis, 'Tracking!', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1, font_color, 1)
+            cv.putText(frame_vis, 'Press r to reset', (20, 55), cv.FONT_HERSHEY_COMPLEX_SMALL, 1, font_color, 1)
+            cv.putText(frame_vis, 'Press q to quit', (20, 80), cv.FONT_HERSHEY_COMPLEX_SMALL, 1, font_color, 1)
+
+            # Display the resulting frame
+            cv.imshow(display_name, frame_vis)
+            key = cv.waitKey(1)
+            if key == ord('q'):
+                break
+
+            if save_results and output_folder:
+                basename = os.path.splitext(os.path.basename(frame_path))[0]
+                output_path = os.path.join(output_folder, f'{basename}.json')
+                mask = out['segmentation'].astype(np.bool_)
+                rle = pycocotools.mask.encode(np.asfortranarray(mask))
+                rle['counts'] = rle['counts'].decode('utf-8')
+                output_dict = {
+                    'bbox': [state[0], state[1], state[0] + state[2], state[1] + state[3]],  # XYXY_ABS
+                    'mask_rle': rle
+                }
+                with open(output_path, 'w') as fp:
+                    json.dump(output_dict, fp)
+
+                output_vis_path = os.path.join(output_folder, f'{basename}.jpg')
+                cv.imwrite(output_vis_path, frame_vis)
+
+        cv.destroyAllWindows()
+
 
     def run_webcam(self, debug=None, visdom_info=None):
         """Run the tracker with the webcam.
