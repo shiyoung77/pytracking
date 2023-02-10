@@ -384,7 +384,7 @@ class Tracker:
             np.savetxt(bbox_file, tracked_bb, delimiter='\t', fmt='%d')
     
     def run_frames(self, frame_paths, optional_mask=None, optional_box=None, debug=None, visdom_info=None,
-                   save_results=False, output_folder=""):
+                   save_results=False, output_folder="", key_frame_paths=None):
         """
         Run the tracker with a list of frames
         """
@@ -434,8 +434,8 @@ class Tracker:
                            1.5, (0, 0, 0), 1)
                 x, y, w, h = cv.selectROI(display_name, frame_vis, fromCenter=False)
                 init_state = [x, y, w, h]
-                init_out = tracker.initialize(frame, _build_init_info(init_state))
-                prev_output['segmentation_raw'] = init_out['segmentation_raw']
+                out = tracker.initialize(frame, _build_init_info(init_state))
+                prev_output['segmentation_raw'] = out['segmentation_raw']
                 break
         elif optional_mask is not None:
             mask = optional_mask.astype(bool)
@@ -443,16 +443,22 @@ class Tracker:
             x1, y1 = xs.min(), ys.min()
             x2, y2 = xs.max(), ys.max()
             init_state = [x1, y1, x2 - x1, y2 - y1]  # XYWH_ABS
-            tracker.initialize(frame, _build_init_info(init_state))
+            out = tracker.initialize(frame, _build_init_info(init_state))
             prev_output['segmentation_raw'] = OrderedDict({1: mask.astype(np.float32)})
             print("Initialize from optional mask")
         else:  # optional_box is not None
             assert isinstance(optional_box, (list, tuple))
             assert len(optional_box) == 4, "valid box's format is [x,y,w,h]"
-            init_out = tracker.initialize(frame, _build_init_info(optional_box))
-            prev_output['segmentation_raw'] = init_out['segmentation_raw']
+            out = tracker.initialize(frame, _build_init_info(optional_box))
+            prev_output['segmentation_raw'] = out['segmentation_raw']
             print("Initialize from optional bbox")
 
+        if key_frame_paths is None:
+            key_frame_paths = set(frame_paths[-1])
+        else:
+            key_frame_paths = set(key_frame_paths)
+
+        output_mask = []
         for frame_idx, frame_path in enumerate(tqdm(frame_paths)):
             frame = cv.imread(frame_path)
             frame_vis = frame.copy()
@@ -499,7 +505,11 @@ class Tracker:
                 output_vis_path = os.path.join(output_folder, f'{basename}.jpg')
                 cv.imwrite(output_vis_path, frame_vis)
 
+            if frame_path in key_frame_paths:
+                output_mask.append(out['segmentation'].astype(np.bool_))
+
         cv.destroyAllWindows()
+        return output_mask
 
 
     def run_webcam(self, debug=None, visdom_info=None):
