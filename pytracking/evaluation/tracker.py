@@ -412,7 +412,6 @@ class Tracker:
             print(f"{output_folder = }")
             os.makedirs(output_folder, exist_ok=True)
 
-        print(f"{frame_paths[0] = }")
         frame = cv.imread(frame_paths[0])
         assert frame is not None, f"File doesn't exist: {frame_paths[0] = }"
         im_h, im_w, _ = frame.shape
@@ -454,7 +453,8 @@ class Tracker:
             print("Initialize from optional bbox")
 
         if key_frame_paths is None:
-            key_frame_paths = set(frame_paths[-1])
+            key_frame_paths = set()
+            key_frame_paths.add(frame_paths[-1])
         else:
             key_frame_paths = set(key_frame_paths)
 
@@ -510,7 +510,6 @@ class Tracker:
 
         cv.destroyAllWindows()
         return output_mask
-
 
     def run_webcam(self, debug=None, visdom_info=None):
         """Run the tracker with the webcam.
